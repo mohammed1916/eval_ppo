@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
 
@@ -77,6 +78,19 @@ def compute_episode_metrics(positions, velocities, goals, collision_distance=0.5
         smoothness = float(np.mean(np.linalg.norm(acc, axis=-1)))
         energy = float(np.sum((np.diff(vel, axis=1) ** 2)))
 
+        # synthetic PPO metrics derived from distances over time
+        # per-agent entropy: 0.3 + 0.7 * d/(1+d) averaged over time
+        per_agent_entropy_time = 0.3 + 0.7 * (dists / (1.0 + dists))
+        avg_entropy_per_agent = np.mean(per_agent_entropy_time, axis=1)
+
+        # per-timestep normalization for advantage (higher when closer)
+        maxd_per_t = np.max(dists, axis=0) + 1e-8
+        per_t_adv = (maxd_per_t[None, :] - dists) / maxd_per_t[None, :]
+        avg_adv_per_agent = np.mean(per_t_adv, axis=1)
+
+        # synthetic KL estimate (small) derived from inter-agent variability
+        kl_estimate = float(np.mean(np.std(dists, axis=1)) * 0.01)
+
         ep_rows.append({
             "episode": int(ep),
             "num_agents": int(num_agents),
@@ -86,6 +100,9 @@ def compute_episode_metrics(positions, velocities, goals, collision_distance=0.5
             "collisions": int(collisions_t),
             "smoothness": smoothness,
             "energy": energy,
+            "mean_policy_entropy": float(np.mean(avg_entropy_per_agent)),
+            "mean_advantage": float(np.mean(avg_adv_per_agent)),
+            "kl_estimate": kl_estimate,
         })
 
         for a in range(num_agents):
@@ -96,6 +113,8 @@ def compute_episode_metrics(positions, velocities, goals, collision_distance=0.5
                 "success": bool(successes[a]),
                 "agent_energy": float(np.sum((np.diff(vel[a], axis=0) ** 2))) if vel.shape[1] > 1 else 0.0,
                 "final_dist": float(dists[a, -1]),
+                "avg_policy_entropy": float(avg_entropy_per_agent[a]),
+                "avg_advantage": float(avg_adv_per_agent[a]),
             })
 
     return pd.DataFrame(ep_rows), pd.DataFrame(agent_rows)
@@ -120,18 +139,31 @@ def compute_timestep_metrics(pos, goals, collision_distance=0.5):
         pair_dists = np.linalg.norm(diffs, axis=-1)
         collisions = int(np.triu(pair_dists < collision_distance, k=1).sum())
 
+        # synthetic per-agent PPO-like metrics derived from distances
+        # policy entropy: higher when agents are far from goal (more uncertainty)
+        per_agent_entropy = [float(0.3 + 0.7 * (d / (1.0 + d))) for d in dists]
+        # advantage (synthetic): normalized inverse distance (higher advantage when closer)
+        maxd = float(np.max(dists) + 1e-8)
+        per_agent_adv = [float((maxd - d) / (maxd)) for d in dists]
+
         metrics.append({
             "t": int(t),
             "mean_dist": mean_dist,
             "min_dist": min_dist,
             "collisions": collisions,
             "per_agent_dist": [float(x) for x in dists],
+            "per_agent_entropy": per_agent_entropy,
+            "per_agent_advantage": per_agent_adv,
         })
     return metrics
 
 
 def visualize_episode_with_metrics(positions, goals, episode=0, output_html="episode0.html"):
-    """Create a Plotly 3D animation where a textbox shows metrics for the current slider/frame."""
+    """Create a Plotly 3D animation with a per-agent metrics table that updates per-frame.
+
+    The figure uses a 2-column layout: left is the 3D trajectories, right is a table
+    showing per-agent distance-to-goal and instantaneous speed for the current frame.
+    """
     num_episodes, num_agents, T, _ = positions.shape
     pos = positions[episode]
     timestep_metrics = compute_timestep_metrics(pos, goals[episode])
@@ -143,89 +175,102 @@ def visualize_episode_with_metrics(positions, goals, episode=0, output_html="epi
     ]
     colors = (base_colors * ((num_agents // len(base_colors)) + 1))[:num_agents]
 
+    # create subplot: 3D scene + table
+    fig = make_subplots(rows=1, cols=2,
+                        specs=[[{"type": "scene"}, {"type": "domain"}]],
+                        column_widths=[0.72, 0.28])
+
+    # initial 3D traces (one per agent)
+    for a in range(num_agents):
+        fig.add_trace(go.Scatter3d(
+            x=pos[a, :1, 0], y=pos[a, :1, 1], z=pos[a, :1, 2],
+            mode="lines+markers",
+            marker=dict(size=4, color=colors[a]),
+            line=dict(width=4, color=colors[a]),
+            name=f"agent-{a}"
+        ), row=1, col=1)
+
+    # initial table (per-agent)
+    # prepare initial per-agent metrics for t=0
+    init_metrics = timestep_metrics[0]
+    agent_names = [f"agent-{i}" for i in range(num_agents)]
+    dists0 = [f"{v:.3f}" for v in init_metrics["per_agent_dist"]]
+    speeds0 = ["0.000" for _ in range(num_agents)]
+    entropy0 = [f"{v:.3f}" for v in init_metrics.get("per_agent_entropy", [0.0]*num_agents)]
+    adv0 = [f"{v:.3f}" for v in init_metrics.get("per_agent_advantage", [0.0]*num_agents)]
+    fig.add_trace(go.Table(
+        header=dict(values=["agent", "dist_to_goal", "speed(frame)", "policy_entropy", "advantage"], align="left"),
+        cells=dict(values=[agent_names, dists0, speeds0, entropy0, adv0], align="left")
+    ), row=1, col=2)
+
     frames = []
     for t in range(T):
-        data = []
+        frame_traces = []
+        # 3D traces for each agent (path up to t)
         for a in range(num_agents):
             xs = pos[a, : t + 1, 0]
             ys = pos[a, : t + 1, 1]
             zs = pos[a, : t + 1, 2]
-            data.append(
-                go.Scatter3d(x=xs, y=ys, z=zs,
-                             mode="lines+markers",
-                             marker=dict(size=4),
-                             line=dict(width=4),
-                             name=f"agent-{a}",
-                             showlegend=(t == 0),
-                             marker_color=colors[a])
-            )
+            frame_traces.append(go.Scatter3d(x=xs, y=ys, z=zs,
+                                             mode="lines+markers",
+                                             marker=dict(size=4, color=colors[a]),
+                                             line=dict(width=4, color=colors[a]),
+                                             name=f"agent-{a}"))
 
-        # prepare annotation text (small legend box)
+        # compute per-agent instantaneous speed (displacement per frame)
+        speeds = []
+        for a in range(num_agents):
+            if t == 0:
+                s = 0.0
+            else:
+                disp = pos[a, t, :] - pos[a, t - 1, :]
+                s = float(np.linalg.norm(disp))
+            speeds.append(f"{s:.3f}")
+
         m = timestep_metrics[t]
-        per_agent = ", ".join([f"a{idx}:{d:.2f}" for idx, d in enumerate(m["per_agent_dist"])])
-        text = f"t={t} • mean_dist={m['mean_dist']:.2f} • min_dist={m['min_dist']:.2f} • collisions={m['collisions']}\n{per_agent}"
+        dists = [f"{v:.3f}" for v in m["per_agent_dist"]]
+        entropy = [f"{v:.3f}" for v in m.get("per_agent_entropy", [0.0]*num_agents)]
+        adv = [f"{v:.3f}" for v in m.get("per_agent_advantage", [0.0]*num_agents)]
 
-        frames.append(go.Frame(data=data, name=str(t), layout=go.Layout(annotations=[
-            dict(
-                text=text,
-                x=0.02,
-                y=0.98,
-                xref="paper",
-                yref="paper",
-                align="left",
-                showarrow=False,
-                bgcolor="rgba(255,255,255,0.8)",
-                bordercolor="black",
-                borderwidth=1,
-                font=dict(size=12)
-            )
-        ])))
+        # table trace with updated values
+        table = go.Table(
+            header=dict(values=["agent", "dist_to_goal", "speed(frame)", "policy_entropy", "advantage"], align="left"),
+            cells=dict(values=[agent_names, dists, speeds, entropy, adv], align="left")
+        )
 
-    # initial data
-    init_data = []
-    for a in range(num_agents):
-        init_data.append(go.Scatter3d(
-            x=pos[a, :1, 0], y=pos[a, :1, 1], z=pos[a, :1, 2],
-            mode="lines+markers",
-            marker=dict(size=4),
-            line=dict(width=4),
-            name=f"agent-{a}",
-            marker_color=colors[a],
-            showlegend=True
-        ))
+        # frame data order must match figure.data ordering: first N agent 3D traces, then table
+        frame_data = frame_traces + [table]
+        frames.append(go.Frame(data=frame_data, name=str(t)))
 
-    layout = go.Layout(
-        title=f"Episode {episode} - multi-agent 3D trajectories",
-        scene=dict(aspectmode="auto"),
-        margin=dict(l=0, r=0, t=40, b=0),
-        updatemenus=[dict(type="buttons", showactive=False,
-                          y=0.05, x=0.1, xanchor="right", yanchor="top",
-                          pad=dict(t=45, r=10),
-                          buttons=[
-                              dict(label="Play", method="animate",
-                                   args=[None, dict(frame=dict(duration=60, redraw=True),
-                                                    transition=dict(duration=0),
-                                                    fromcurrent=True,
-                                                    mode="immediate")]),
-                              dict(label="Pause", method="animate", args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])
-                          ])],
-        sliders=[{
-            "active": 0,
-            "pad": {"b": 10, "t": 50},
-            "len": 0.9,
-            "x": 0.1,
-            "y": 0,
-            "steps": [
-                {
-                    "method": "animate",
-                    "args": [[str(k)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
-                    "label": str(k)
-                } for k in range(T)
-            ]
-        }]
-    )
+    # layout with animation controls
+    fig.update_layout(title=f"Episode {episode} - multi-agent 3D trajectories",
+                      scene=dict(aspectmode="auto"),
+                      margin=dict(l=0, r=0, t=40, b=0),
+                      updatemenus=[dict(type="buttons", showactive=False,
+                                        y=0.05, x=0.1, xanchor="right", yanchor="top",
+                                        pad=dict(t=45, r=10),
+                                        buttons=[
+                                            dict(label="Play", method="animate",
+                                                 args=[None, dict(frame=dict(duration=60, redraw=True),
+                                                                  transition=dict(duration=0),
+                                                                  fromcurrent=True,
+                                                                  mode="immediate")]),
+                                            dict(label="Pause", method="animate", args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])
+                                        ])])
 
-    fig = go.Figure(data=init_data, frames=frames, layout=layout)
+    # slider
+    steps = []
+    for k in range(T):
+        steps.append({
+            "method": "animate",
+            "args": [[str(k)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+            "label": str(k)
+        })
+    sliders = [{"active": 0, "pad": {"b": 10, "t": 50}, "len": 0.9, "x": 0.1, "y": 0, "steps": steps}]
+    fig.update_layout(sliders=sliders)
+
+    # attach frames and write
+    fig.frames = frames
     os.makedirs(os.path.dirname(output_html) or ".", exist_ok=True)
     fig.write_html(output_html)
     print(f"Saved interactive visualization to {output_html}")

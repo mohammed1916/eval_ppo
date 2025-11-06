@@ -175,10 +175,13 @@ def visualize_episode_with_metrics(positions, goals, episode=0, output_html="epi
     ]
     colors = (base_colors * ((num_agents // len(base_colors)) + 1))[:num_agents]
 
-    # create subplot: 3D scene + table
-    fig = make_subplots(rows=1, cols=2,
-                        specs=[[{"type": "scene"}, {"type": "domain"}]],
-                        column_widths=[0.72, 0.28])
+    # create subplot: top row = 3D scene + table, bottom row = time-series (spans both cols)
+    fig = make_subplots(rows=2, cols=2,
+               specs=[[{"type": "scene"}, {"type": "domain"}],
+                   [{"colspan": 2, "type": "xy"}, None]],
+               column_widths=[0.72, 0.28],
+               row_heights=[0.65, 0.35],
+               vertical_spacing=0.08)
 
     # initial 3D traces (one per agent)
     for a in range(num_agents):
@@ -202,6 +205,13 @@ def visualize_episode_with_metrics(positions, goals, episode=0, output_html="epi
         header=dict(values=["agent", "dist_to_goal", "speed(frame)", "policy_entropy", "advantage"], align="left"),
         cells=dict(values=[agent_names, dists0, speeds0, entropy0, adv0], align="left")
     ), row=1, col=2)
+
+    # prepare mean distance time-series (bottom subplot) and initial marker
+    mean_dist_series = [m["mean_dist"] for m in timestep_metrics]
+    # add static mean line (row=2, col=1 spanning both columns)
+    fig.add_trace(go.Scatter(x=list(range(T)), y=mean_dist_series, mode="lines", name="mean_dist", line=dict(color="#444444")), row=2, col=1)
+    # add moving marker (will be updated per-frame)
+    fig.add_trace(go.Scatter(x=[0], y=[mean_dist_series[0]], mode="markers", marker=dict(size=10, color="red"), name="current_t"), row=2, col=1)
 
     frames = []
     for t in range(T):
@@ -238,8 +248,12 @@ def visualize_episode_with_metrics(positions, goals, episode=0, output_html="epi
             cells=dict(values=[agent_names, dists, speeds, entropy, adv], align="left")
         )
 
-        # frame data order must match figure.data ordering: first N agent 3D traces, then table
-        frame_data = frame_traces + [table]
+        # update marker for mean_dist
+        marker = go.Scatter(x=[t], y=[mean_dist_series[t]], mode="markers", marker=dict(size=10, color="red"))
+
+        # frame data order must match figure.data ordering:
+        # [agent0..agentN] (row1,col1 traces), table (row1,col2), mean_line (row2,col1), marker (row2,col1)
+        frame_data = frame_traces + [table, go.Scatter(x=list(range(T)), y=mean_dist_series, mode="lines", line=dict(color="#444444")), marker]
         frames.append(go.Frame(data=frame_data, name=str(t)))
 
     # layout with animation controls
@@ -276,6 +290,122 @@ def visualize_episode_with_metrics(positions, goals, episode=0, output_html="epi
     print(f"Saved interactive visualization to {output_html}")
 
 
+
+def enrich_with_ppo_metrics(ep_df, agent_df, positions, goals, goal_radius=0.5):
+    """Add PPO-style aggregate metrics to ep_df and agent_df.
+
+    - team_reward: sum of agent returns (already in sum_cumulative_reward)
+    - team_success: whether all agents succeeded in the episode
+    - cooperation_index: mean off-diagonal correlation between agents' episodic returns
+    - sample_efficiency series: mean episodic reward per episode (returned separately)
+    - convergence_stability: rolling variance of mean episodic reward
+    """
+    # per-agent episodic returns from agent_df
+    per_episode = {}
+    for _, row in agent_df.iterrows():
+        ep = int(row["episode"])
+        per_episode.setdefault(ep, []).append(row["cum_reward"])
+
+    episodes = sorted(per_episode.keys())
+    mean_rewards = []
+    team_success = []
+    coop_indices = []
+
+    for ep in episodes:
+        arr = np.array(per_episode[ep])
+        mean_rewards.append(float(arr.mean()))
+        # team success: all agents success in this episode
+        ep_agent_rows = agent_df[agent_df["episode"] == ep]
+        all_success = bool(ep_agent_rows["success"].all())
+        team_success.append(int(all_success))
+
+        # cooperation index: proxy via correlation of agent returns with team mean
+        if arr.size > 1 and np.std(arr) > 0:
+            team_mean = arr.mean()
+            # correlation of returns with team mean; if degenerate set 0
+            try:
+                corr = float(np.corrcoef(arr, np.repeat(team_mean, arr.size))[0, 1])
+            except Exception:
+                corr = 0.0
+            if np.isnan(corr):
+                corr = 0.0
+            coop_indices.append(corr)
+        else:
+            coop_indices.append(0.0)
+
+    # attach new columns to ep_df by episode order
+    ep_df = ep_df.copy()
+    ep_df["team_success"] = [team_success[i] if i < len(team_success) else 0 for i in range(len(ep_df))]
+    ep_df["cooperation_index"] = [coop_indices[i] if i < len(coop_indices) else 0.0 for i in range(len(ep_df))]
+    ep_df["mean_episode_reward"] = [mean_rewards[i] if i < len(mean_rewards) else 0.0 for i in range(len(ep_df))]
+
+    # sample efficiency timeseries (episode index -> mean reward)
+    sample_efficiency = pd.DataFrame({"episode": episodes, "mean_episode_reward": mean_rewards})
+    sample_efficiency["rolling_var_3"] = sample_efficiency["mean_episode_reward"].rolling(window=3, min_periods=1).var()
+
+    return ep_df, agent_df, sample_efficiency
+
+
+def plot_metrics_dashboard(ep_df, sample_efficiency, out_html="metrics_dashboard.html"):
+    """Create a simple Plotly dashboard with mean episodic reward and team reward per episode."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    # Build a 3-row subplot: mean episodic reward, team reward, combined metrics
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.08,
+                        subplot_titles=("Mean Episodic Reward", "Team Reward per Episode", "Collisions / Entropy / Advantage"))
+
+    # Row 1: mean episodic reward (sample_efficiency)
+    fig.add_trace(go.Scatter(x=sample_efficiency['episode'], y=sample_efficiency['mean_episode_reward'], mode='lines+markers', name='mean_episode_reward'), row=1, col=1)
+    fig.update_yaxes(title_text='mean reward', row=1, col=1)
+
+    # Row 2: team reward
+    if 'sum_cumulative_reward' in ep_df.columns:
+        fig.add_trace(go.Bar(x=ep_df['episode'], y=ep_df['sum_cumulative_reward'], name='team_reward'), row=2, col=1)
+        fig.update_yaxes(title_text='team reward', row=2, col=1)
+    else:
+        fig.add_trace(go.Bar(x=ep_df['episode'], y=ep_df['mean_cumulative_reward'], name='mean_agent_reward'), row=2, col=1)
+        fig.update_yaxes(title_text='mean agent reward', row=2, col=1)
+
+    # Row 3: collisions, mean_policy_entropy, mean_advantage if present
+    if 'collisions' in ep_df.columns:
+        fig.add_trace(go.Scatter(x=ep_df['episode'], y=ep_df['collisions'], mode='lines+markers', name='collisions'), row=3, col=1)
+    if 'mean_policy_entropy' in ep_df.columns:
+        fig.add_trace(go.Scatter(x=ep_df['episode'], y=ep_df['mean_policy_entropy'], mode='lines+markers', name='mean_policy_entropy'), row=3, col=1)
+    if 'mean_advantage' in ep_df.columns:
+        fig.add_trace(go.Scatter(x=ep_df['episode'], y=ep_df['mean_advantage'], mode='lines+markers', name='mean_advantage'), row=3, col=1)
+    fig.update_yaxes(title_text='value', row=3, col=1)
+
+    fig.update_xaxes(title_text='episode', row=3, col=1)
+
+    # write to HTML
+    html = fig.to_html(full_html=True, include_plotlyjs='cdn')
+    with open(out_html, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"Saved metrics dashboard to {out_html}")
+    import plotly.express as px
+    # line plot: mean episode reward
+    fig1 = px.line(sample_efficiency, x="episode", y="mean_episode_reward", title="Mean Episodic Reward (per episode)")
+    # bar plot: team reward from ep_df
+    if "sum_cumulative_reward" in ep_df.columns:
+        fig2 = px.bar(ep_df, x="episode", y="sum_cumulative_reward", title="Team Reward per Episode")
+    else:
+        fig2 = px.bar(ep_df, x="episode", y="mean_cumulative_reward", title="Mean Agent Reward per Episode")
+
+    # combine into a single HTML file by writing separate divs
+    html = "<html><head><meta charset=\"utf-8\"></head><body>"
+    html += fig1.to_html(full_html=False, include_plotlyjs='cdn')
+    html += "<hr>"
+    html += fig2.to_html(full_html=False, include_plotlyjs=False)
+    html += "</body></html>"
+
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"Saved metrics dashboard to {out_html}")
+
+
 def save_metrics(ep_df, agent_df, out_dir="metrics_output"):
     os.makedirs(out_dir, exist_ok=True)
     ep_csv = os.path.join(out_dir, "episode_metrics.csv")
@@ -291,5 +421,14 @@ if __name__ == "__main__":
     positions, velocities, goals = generate_trajectories(num_episodes=6, num_agents=5, T=150, dt=0.1, arena_size=6.0, max_speed=1.2, seed=123)
     ep_df, agent_df = compute_episode_metrics(positions, velocities, goals, collision_distance=0.6)
     print(ep_df.head())
+    # Save baseline metrics
     save_metrics(ep_df, agent_df, out_dir="metrics_output")
+
+    # Enrich with PPO-style aggregates (team success, cooperation index, sample-efficiency)
+    ep_df2, agent_df2, sample_eff = enrich_with_ppo_metrics(ep_df, agent_df, positions, goals, goal_radius=0.5)
+    # Save enriched metrics and dashboard
+    save_metrics(ep_df2, agent_df2, out_dir="metrics_output")
+    plot_metrics_dashboard(ep_df2, sample_eff, out_html="metrics_dashboard.html")
+
+    # Create interactive episode visualization (per-agent table + 3D)
     visualize_episode_with_metrics(positions, goals, episode=0, output_html="episode0.html")
